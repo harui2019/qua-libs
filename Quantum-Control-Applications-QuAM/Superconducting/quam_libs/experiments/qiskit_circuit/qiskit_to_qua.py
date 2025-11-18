@@ -15,7 +15,7 @@ def create_target(machine: QuAM):
     gate_map = get_standard_gate_name_mapping()
     single_qubit_prop = {(i,): None for i in range(len(machine.active_qubits))}
     two_qubit_prop = {qubit_pairs_mapping[pair.name]: None for pair in machine.active_qubit_pairs}
-    for instr in ["sx", "x", "rz", "measure", "reset", "y"]:
+    for instr in ["sx", "x", "rz", "measure", "reset"]:
         target.add_instruction(gate_map[instr], single_qubit_prop)
     target.add_instruction(gate_map["cz"], two_qubit_prop)
     return target
@@ -29,7 +29,7 @@ def qiskit_to_qua_macro(circuit: QuantumCircuit, machine: QuAM, target_qubits: L
     else:
         qc = circuit
     qubit_indices = {qubit: qc.find_bit(qubit).index for i, qubit in enumerate(qc.qubits)}
-    
+    print(qc)
     cregs = {creg.name: declare(bool, value= [False] * creg.size) for creg in qc.cregs}
     
     for instruction in qc.data:
@@ -37,6 +37,30 @@ def qiskit_to_qua_macro(circuit: QuantumCircuit, machine: QuAM, target_qubits: L
             qubits = instruction.qubits
             if instruction.operation.name == "barrier":
                continue
+            if instruction.operation.name == "multiplexed_measurement":
+                involved_qubits = [machine.active_qubits[qubit_indices[q]] for q in qubits]
+                clbits_indices = [qc.find_bit(clbit).index for clbit in instruction.clbits]
+                all_qubits = machine.active_qubits
+                all_qubits[0].align(*all_qubits[1:])
+                results = {}
+                
+                for q, qubit in enumerate(all_qubits):
+                    if qubit in involved_qubits:
+                        index = involved_qubits.index(qubit)
+                        result_q = qubit.apply('measure')
+                        results[index] = result_q
+
+                    else:
+                        qubit.resonator.play('readout')
+                all_qubits[0].align(*all_qubits[1:])
+                for clbit in instruction.clbits:
+                    registers = qc.find_bit(clbit).registers
+                    if len(registers) > 1:
+                        raise ValueError(f"Multiple registers found for clbit: {clbit}")
+                    creg, index = registers[0]
+                    assign(cregs[creg.name][clbits_indices[index]], results[index])
+                continue
+
             if len(qubits) == 2:
                 qubit_control = machine.active_qubits[qubit_indices[qubits[0]]]
                 qubit_target = machine.active_qubits[qubit_indices[qubits[1]]]
@@ -138,7 +162,7 @@ def design_qua_program_from_qiskit(
     machine: "QuAM",
     target_qubits: list["Transmon"] | None = None,
     n_shots: int = 1024,
-    optimization_level: int = 1,
+    optimization_level: Optional[int] = None,
 ):
     """
     Constructs a QUA program for a given Qiskit QuantumCircuit.
@@ -157,8 +181,6 @@ def design_qua_program_from_qiskit(
         raise ValueError("The circuit does not have any classical registers.")
     if not target_qubits and circuit.num_qubits != len(machine.active_qubits):
         raise ValueError("The target qubits are not specified and the circuit does not have the same number of qubits as the machine.")
-    if optimization_level not in [0, 1, 2, 3]:
-        raise ValueError("The optimization level must be 0, 1, 2, or 3.")
     if n_shots <= 0:
         raise ValueError("The number of shots must be greater than 0.")
 
@@ -169,8 +191,7 @@ def design_qua_program_from_qiskit(
         shot = declare(int)
         cregs_streams = {creg.name: declare_stream() for creg in circuit.cregs}
 
-        machine.apply_all_flux_to_min()
-        machine.apply_all_couplers_to_min()
+        machine.apply_all_flux_to_joint_idle()
 
         with for_(shot, 0, shot < n_shots, shot + 1):
             if not has_reset_at_boundary(circuit):
