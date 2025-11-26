@@ -48,6 +48,7 @@ def tranpiled_circuit_to_qua_macro(transpiled_qc: QuantumCircuit, machine: QuAM)
 
     print(transpiled_qc)
     cregs = {creg.name: declare(bool, value=[False] * creg.size) for creg in transpiled_qc.cregs}
+    qubit_indices = {qubit: transpiled_qc.find_bit(qubit).index for i, qubit in enumerate(transpiled_qc.qubits)}
 
     for instruction in transpiled_qc.data:
         try:
