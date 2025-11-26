@@ -7,11 +7,17 @@ from typing import List, Optional
 import numpy as np
 from qm import generate_qua_script
 
+
 def create_target(machine: QuAM):
-    qubit_pairs_mapping = {qubit_pair.name: (machine.active_qubits.index(qubit_pair.qubit_control), machine.active_qubits.index(qubit_pair.qubit_target)) for qubit_pair in machine.active_qubit_pairs}
-    
-    target = Target('quam', len(machine.active_qubits),
-    dt=1e-9, granularity=4, min_length=16)
+    qubit_pairs_mapping = {
+        qubit_pair.name: (
+            machine.active_qubits.index(qubit_pair.qubit_control),
+            machine.active_qubits.index(qubit_pair.qubit_target),
+        )
+        for qubit_pair in machine.active_qubit_pairs
+    }
+
+    target = Target("quam", len(machine.active_qubits), dt=1e-9, granularity=4, min_length=16)
     gate_map = get_standard_gate_name_mapping()
     single_qubit_prop = {(i,): None for i in range(len(machine.active_qubits))}
     two_qubit_prop = {qubit_pairs_mapping[pair.name]: None for pair in machine.active_qubit_pairs}
@@ -21,40 +27,51 @@ def create_target(machine: QuAM):
     return target
 
 
-def qiskit_to_qua_macro(circuit: QuantumCircuit, machine: QuAM, target_qubits: List[Transmon] | None = None, optimization_level: Optional[int] = None):
-    initial_layout = [machine.active_qubits.index(qubit) for qubit in target_qubits] if target_qubits is not None else None
+def transpile_circuit(
+    circuit: QuantumCircuit,
+    machine: QuAM,
+    target_qubits: List[Transmon] | None = None,
+    optimization_level: Optional[int] = None,
+) -> QuantumCircuit:
+    initial_layout = (
+        [machine.active_qubits.index(qubit) for qubit in target_qubits] if target_qubits is not None else None
+    )
     if optimization_level is not None:
         target = create_target(machine)
         qc = transpile(circuit, target=target, initial_layout=initial_layout, optimization_level=optimization_level)
     else:
         qc = circuit
-    qubit_indices = {qubit: qc.find_bit(qubit).index for i, qubit in enumerate(qc.qubits)}
-    print(qc)
-    cregs = {creg.name: declare(bool, value= [False] * creg.size) for creg in qc.cregs}
-    
-    for instruction in qc.data:
+    return qc
+
+
+def tranpiled_circuit_to_qua_macro(transpiled_qc: QuantumCircuit, machine: QuAM):
+
+    print(transpiled_qc)
+    cregs = {creg.name: declare(bool, value=[False] * creg.size) for creg in transpiled_qc.cregs}
+
+    for instruction in transpiled_qc.data:
         try:
             qubits = instruction.qubits
             if instruction.operation.name == "barrier":
-               continue
+                continue
             if instruction.operation.name == "multiplexed_measurement":
                 involved_qubits = [machine.active_qubits[qubit_indices[q]] for q in qubits]
-                clbits_indices = [qc.find_bit(clbit).index for clbit in instruction.clbits]
+                clbits_indices = [transpiled_qc.find_bit(clbit).index for clbit in instruction.clbits]
                 all_qubits = machine.active_qubits
                 all_qubits[0].align(*all_qubits[1:])
                 results = {}
-                
+
                 for q, qubit in enumerate(all_qubits):
                     if qubit in involved_qubits:
                         index = involved_qubits.index(qubit)
-                        result_q = qubit.apply('measure')
+                        result_q = qubit.apply("measure")
                         results[index] = result_q
 
                     else:
-                        qubit.resonator.play('readout')
+                        qubit.resonator.play("readout")
                 all_qubits[0].align(*all_qubits[1:])
                 for clbit in instruction.clbits:
-                    registers = qc.find_bit(clbit).registers
+                    registers = transpiled_qc.find_bit(clbit).registers
                     if len(registers) > 1:
                         raise ValueError(f"Multiple registers found for clbit: {clbit}")
                     creg, index = registers[0]
@@ -75,19 +92,32 @@ def qiskit_to_qua_macro(circuit: QuantumCircuit, machine: QuAM, target_qubits: L
                 qubit.align()
                 if instruction.clbits:
                     for clbit in instruction.clbits:
-                        registers = qc.find_bit(clbit).registers
+                        registers = transpiled_qc.find_bit(clbit).registers
                         if len(registers) > 1:
                             raise ValueError(f"Multiple registers found for clbit: {clbit}")
                         creg, index = registers[0]
-                        assign(cregs[creg.name][index], result)    
-                        
+                        assign(cregs[creg.name][index], result)
+
             else:
                 raise ValueError(f"Unsupported number of qubits: {len(qubits)}")
         except Exception as e:
             print(f"Error processing instruction: {instruction}")
             raise e
-    
+
     return cregs
+
+
+def qiskit_to_qua_macro(
+    circuit: QuantumCircuit,
+    machine: QuAM,
+    target_qubits: List[Transmon] | None = None,
+    optimization_level: Optional[int] = None,
+):
+    qc = transpile_circuit(circuit, machine, target_qubits, optimization_level)
+    cregs = tranpiled_circuit_to_qua_macro(qc, machine)
+
+    return cregs
+
 
 def has_reset_at_boundary(circuit: QuantumCircuit) -> bool:
     """Check if each qubit in the QuantumCircuit has a reset at the start or end."""
@@ -107,17 +137,19 @@ def has_reset_at_boundary(circuit: QuantumCircuit) -> bool:
     for qubit, qubit_insts in qubit_instructions.items():
         if not qubit_insts:
             continue  # No instructions means qubit remained in reset state
-            
+
         # Check first operation on this qubit
         has_start_reset = qubit_insts[0].operation.name == "reset"
-        
+
         # Check last operation on this qubit
         has_end_reset = qubit_insts[-1].operation.name == "reset"
-        
+
         if not (has_start_reset or has_end_reset):
             return False
 
     return True
+
+
 def ensure_resets_for_active_qubits(circuit: QuantumCircuit) -> QuantumCircuit:
     """
     Ensures that every active (non-idle) qubit in the circuit has a reset
@@ -146,9 +178,7 @@ def ensure_resets_for_active_qubits(circuit: QuantumCircuit) -> QuantumCircuit:
         first_instr = circuit.data[use_indices[0]][0]
         last_instr = circuit.data[use_indices[-1]][0]
 
-        has_reset_at_start_or_end = (
-            first_instr.name == "reset" or last_instr.name == "reset"
-        )
+        has_reset_at_start_or_end = first_instr.name == "reset" or last_instr.name == "reset"
 
         # If qubit is active and has no reset at start or end, prepend one
         if not has_reset_at_start_or_end:
@@ -180,7 +210,9 @@ def design_qua_program_from_qiskit(
     if not circuit.cregs:
         raise ValueError("The circuit does not have any classical registers.")
     if not target_qubits and circuit.num_qubits != len(machine.active_qubits):
-        raise ValueError("The target qubits are not specified and the circuit does not have the same number of qubits as the machine.")
+        raise ValueError(
+            "The target qubits are not specified and the circuit does not have the same number of qubits as the machine."
+        )
     if n_shots <= 0:
         raise ValueError("The number of shots must be greater than 0.")
 
@@ -204,7 +236,7 @@ def design_qua_program_from_qiskit(
         with stream_processing():
             for creg, stream in zip(circuit.cregs, cregs_streams.values()):
                 stream.boolean_to_int().buffer(creg.size).save_all(creg.name)
-    
+
     # print("Generated QUA program:")
     # print(generate_qua_script(prog))
     return prog
@@ -241,7 +273,7 @@ def run_qua_program_and_return_results(
     binary = lambda n, size: bin(n)[2:].zfill(size)
     for creg in circuit.cregs:
         results[creg.name] = {binary(int(i), creg.size): 0 for i in range(2**creg.size)}
-        c_reg_result = result_handles.get(creg.name).fetch_all()['value']
+        c_reg_result = result_handles.get(creg.name).fetch_all()["value"]
 
         for shot in range(n_shots):
             c_reg_result_shot = c_reg_result[shot].tolist()

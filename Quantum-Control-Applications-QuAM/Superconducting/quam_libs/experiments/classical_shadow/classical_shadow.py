@@ -19,62 +19,16 @@ from qualang_tools.units import unit
 
 from ..two_qubit_xeb.macros import qua_declaration, reset_qubit, binary
 
+from ...experiments.qiskit_circuit.qiskit_to_qua import (
+    transpile_circuit,
+    tranpiled_circuit_to_qua_macro,
+    qiskit_to_qua_macro,
+)
+
+
 u = unit(coerce_to_integer=True)
 
-def create_target(machine: QuAM):
-    qubit_pairs_mapping = {qubit_pair.name: (machine.active_qubits.index(qubit_pair.qubit_control), machine.active_qubits.index(qubit_pair.qubit_target)) for qubit_pair in machine.active_qubit_pairs}
-    
-    target = Target('quam', len(machine.active_qubits),
-    dt=1e-9, granularity=4, min_length=16)
-    gate_map = get_standard_gate_name_mapping()
-    single_qubit_prop = {(i,): None for i in range(len(machine.active_qubits))}
-    two_qubit_prop = {qubit_pairs_mapping[pair.name]: None for pair in machine.active_qubit_pairs}
-    for instr in ["sx", "x", "rz", "measure", "reset", "y"]:
-        target.add_instruction(gate_map[instr], single_qubit_prop)
-    target.add_instruction(gate_map["cz"], two_qubit_prop)
-    return target
 
-
-def qiskit_to_qua_macro(circuit: QuantumCircuit, machine: QuAM, target_qubits: List[Transmon] | None = None, optimization_level: Optional[int] = None):
-    initial_layout = [machine.active_qubits.index(qubit) for qubit in target_qubits] if target_qubits is not None else None
-    if optimization_level is not None:
-        target = create_target(machine)
-        qc = transpile(circuit, target=target, initial_layout=initial_layout, optimization_level=optimization_level)
-    else:
-        qc = circuit
-    qubit_indices = {qubit: qc.find_bit(qubit).index for i, qubit in enumerate(qc.qubits)}
-    
-    cregs = {creg.name: declare(bool, value= [False] * creg.size) for creg in qc.cregs}
-    
-    for instruction in qc.data:
-        try:
-            qubits = instruction.qubits
-            if instruction.operation.name == "barrier":
-               continue
-            if len(qubits) == 2:
-                qubit_control = machine.active_qubits[qubit_indices[qubits[0]]]
-                qubit_target = machine.active_qubits[qubit_indices[qubits[1]]]
-                qubit_pair = qubit_control @ qubit_target
-                qubit_pair.apply(instruction.operation.name, *instruction.operation.params)
-            elif len(qubits) == 1:
-                qubit = machine.active_qubits[qubit_indices[qubits[0]]]
-                result = qubit.apply(instruction.operation.name, *instruction.operation.params)
-                if instruction.clbits:
-                    for clbit in instruction.clbits:
-                        registers = qc.find_bit(clbit).registers
-                        if len(registers) > 1:
-                            raise ValueError(f"Multiple registers found for clbit: {clbit}")
-                        creg, index = registers[0]
-                        assign(cregs[creg.name][index], result)    
-                        
-            else:
-                raise ValueError(f"Unsupported number of qubits: {len(qubits)}")
-        except Exception as e:
-            print(f"Error processing instruction: {instruction}")
-            raise e
-    
-    return cregs
-   
 class ClassicalShadow:
     def __init__(
         self,
@@ -90,24 +44,25 @@ class ClassicalShadow:
         """
         self.config = config
         self.machine = machine
-        self.data_handler = DataHandler(name="classical_shadow",
-                                        root_data_folder=self.config.save_dir)
-        
-    
+        self.data_handler = DataHandler(name="classical_shadow", root_data_folder=self.config.save_dir)
+        self.transpiled_circuits: list[QuantumCircuit] = []
+
     def cs_prog(self, simulate: bool = False) -> Program:
-        
         """
         Generate the QUA script for the classical shadow experiment.
         """
         n_qubits = self.config.n_qubits
         dim = self.config.dim
         random_gates = len(self.config.measurement_basis) if self.config.measurement_basis is not None else 3
-        ge_thresholds = [qubit.resonator.operations[self.config.readout_pulse_name].threshold 
-                         for qubit in self.config.qubits]
-        
+        ge_thresholds = [
+            qubit.resonator.operations[self.config.readout_pulse_name].threshold for qubit in self.config.qubits
+        ]
+
         with program() as cs_prog:
-            I, I_st, Q, Q_st = qua_declaration(n_qubits=n_qubits, 
-                                               readout_elements=[qubit.resonator for qubit in self.config.qubits],)
+            I, I_st, Q, Q_st = qua_declaration(
+                n_qubits=n_qubits,
+                readout_elements=[qubit.resonator for qubit in self.config.qubits],
+            )
             random_basis = declare(int, size=n_qubits)
             random_basis_stream = declare_stream()
             state = declare(bool, size=self.config.n_qubits)
@@ -118,16 +73,15 @@ class ClassicalShadow:
             j = declare(int)
             shot = declare(int)
             if self.config.gate_indices is not None:
-                gate_indices = [declare(int,
-                                         value=self.config.gate_indices[:, n].tolist()) for n in range(n_qubits)]
-            
+                gate_indices = [declare(int, value=self.config.gate_indices[:, n].tolist()) for n in range(n_qubits)]
+
             self.machine.apply_all_flux_to_min()
             self.machine.apply_all_couplers_to_min()
-            
+
             if simulate:
                 for qubit in self.config.qubits:
                     qubit.xy.update_frequency(0)
-                    
+
             with for_(i, 0, i < self.config.shadow_size, i + 1):
                 # Possible wait time before the experiment
                 # wait(...)
@@ -143,81 +97,101 @@ class ClassicalShadow:
 
                 with for_(shot, 0, shot < self.config.shots_per_snapshot, shot + 1):
                     # Prepare state
-                    if self.config.input_state_circuit_kwargs: #is not None:
-                        qiskit_to_qua_macro(self.config.input_state_circuit(**self.config.input_state_circuit_kwargs), self.machine, self.config.qubits, optimization_level=0)
-                    else:
-                        qiskit_to_qua_macro(self.config.input_state_circuit(), self.machine, self.config.qubits, optimization_level=0)
+                    transpiled_circuit = transpile_circuit(
+                        self.config.input_state_circuit(
+                            **(self.config.input_state_circuit_kwargs if self.config.input_state_circuit_kwargs else {})
+                        ),
+                        self.machine,
+                        self.config.qubits,
+                        optimization_level=0,
+                    )
+                    tranpiled_circuit_to_qua_macro(transpiled_circuit, self.machine)
                     align()
 
                     if self.config.measurement_basis is not None:
-                        for q, qubit, in enumerate(self.config.qubits):
+                        for (
+                            q,
+                            qubit,
+                        ) in enumerate(self.config.qubits):
                             with switch_(random_basis[q], unsafe=False):
                                 # Apply the random basis rotation
                                 for k in range(random_gates):
                                     with case_(k):
-                                        qiskit_to_qua_macro(self.config.measurement_basis[k], self.machine, target_qubits=[qubit], optimization_level=0)
+                                        qiskit_to_qua_macro(
+                                            self.config.measurement_basis[k],
+                                            self.machine,
+                                            target_qubits=[qubit],
+                                            optimization_level=0,
+                                        )
                     else:
-                        for q, qubit, in enumerate(self.config.qubits):
-                        # Replace switch case with conditional plays of the measurement basis rotations
+                        for (
+                            q,
+                            qubit,
+                        ) in enumerate(self.config.qubits):
+                            # Replace switch case with conditional plays of the measurement basis rotations
                             qubit.xy.play("x90", condition=random_basis[q] == 0)
                             qubit.xy.play("-y90", condition=random_basis[q] == 1)
-        
+
                     # Readout
                     # Play the readout on the other resonator to measure in the same condition as when optimizing readout
                     for other_qubit in self.config.readout_qubits:
                         if other_qubit.resonator not in [qubit.resonator for qubit in self.config.qubits]:
                             other_qubit.resonator.play("readout")
-                    for q, qubit, in enumerate(self.config.qubits):
+                    for (
+                        q,
+                        qubit,
+                    ) in enumerate(self.config.qubits):
                         # qubit.align()
-                        qubit.resonator.measure(self.config.readout_pulse_name,
-                                                qua_vars=(I[q], Q[q]))
+                        qubit.resonator.measure(self.config.readout_pulse_name, qua_vars=(I[q], Q[q]))
                         # State Estimation: returned as integer
                         assign(state[q], I[q] > ge_thresholds[q])
-                        assign(state_int, state_int + (1<<q) * Cast.to_int(state[q]))
+                        assign(state_int, state_int + (1 << q) * Cast.to_int(state[q]))
 
-                        reset_qubit(self.config.reset_method,
-                                    qubit,
-                                    threshold=ge_thresholds[q],
-                                    **self.config.reset_kwargs)
+                        reset_qubit(
+                            self.config.reset_method, qubit, threshold=ge_thresholds[q], **self.config.reset_kwargs
+                        )
                     save(state_int, state_int_stream)
                     assign(state_int, 0)
-                
+
             with stream_processing():
                 random_basis_stream.buffer(n_qubits).save_all("random_basis")
                 state_int_stream.buffer(self.config.shots_per_snapshot).save_all("state_int")
-        
+
+        self.transpiled_circuits.append(transpiled_circuit)
+
         return cs_prog
-    
-    def run(self, simulate: bool = False,
-            simulation_config: Optional[SimulationConfig] = None,
-            qmm_cloud_simulator: Optional[QuantumMachinesManager] = None,
-            **simulate_kwargs):
+
+    def run(
+        self,
+        simulate: bool = False,
+        simulation_config: Optional[SimulationConfig] = None,
+        qmm_cloud_simulator: Optional[QuantumMachinesManager] = None,
+        **simulate_kwargs,
+    ):
         config = self.machine.generate_config()
         if simulation_config is None:
-            simulation_config = SimulationConfig(
-                duration=10_000
-            )
+            simulation_config = SimulationConfig(duration=10_000)
         cs_prog = self.cs_prog(simulate=simulate)
         if simulate and qmm_cloud_simulator is not None:
             qmm = qmm_cloud_simulator
         else:
             qmm = self.machine.connect()
-        
+
         qm = qmm.open_qm(config)
         if simulate:
             with open("debug.py", "w+") as f:
                 f.write(generate_qua_script(cs_prog, config))
             job = qm.simulate(cs_prog, simulate=simulation_config, **simulate_kwargs)
-            
+
         elif self.config.generate_new_data:
             job = qm.execute(cs_prog)
         else:
             warnings.warn("No new data will be generated. Please set generate_new_data to True to generate new data.")
-            return 
-        
+            return
+
         return ClassicalShadowJob(job, self.config, self.data_handler)
-        
-            
+
+
 class ClassicalShadowJob:
     def __init__(self, job: RunningQmJob | SimulatedJob, config: ShadowConfig, data_handler: DataHandler):
         """
@@ -234,38 +208,40 @@ class ClassicalShadowJob:
         self.config = config
         self.data_handler = data_handler
         self._gate_indices = np.zeros((self.config.shadow_size, self.config.n_qubits), dtype=int)
-        
-        
+
     def _get_circuits(self):
         """
         Get the circuits from the job.
         """
         shadow_size = self.config.shadow_size
-        gates = self._result_handles["random_basis"].fetch_all()['value']
+        gates = self._result_handles["random_basis"].fetch_all()["value"]
         input_state_circuit = self.config.input_state_circuit(**self.config.input_state_circuit_kwargs)
         for i in range(shadow_size):
             for j in range(self.config.n_qubits):
                 self._gate_indices[i, j] = gates[i][j]
-                
+
         circuits = [QuantumCircuit(self.config.n_qubits) for _ in range(shadow_size)]
         for i in range(shadow_size):
             circuits[i].compose(input_state_circuit, inplace=True)
             for j in range(self.config.n_qubits):
-                meas_circuit = self.config.measurement_basis[self._gate_indices[i, j]] if self.config.measurement_basis is not None else None
+                meas_circuit = (
+                    self.config.measurement_basis[self._gate_indices[i, j]]
+                    if self.config.measurement_basis is not None
+                    else None
+                )
                 if meas_circuit is None:
                     meas_circuits = {0: QuantumCircuit(1), 1: QuantumCircuit(1), 2: QuantumCircuit(1)}
                     meas_circuits[0].sx(0)
                     meas_circuits[1].append(SYdgGate(), [0])
                     meas_circuit = meas_circuits[self._gate_indices[i, j]]
-                circuits[i].compose(self.config.measurement_basis[self._gate_indices[i, j]],
-                                   inplace=True, qubits=[j])
+                circuits[i].compose(self.config.measurement_basis[self._gate_indices[i, j]], inplace=True, qubits=[j])
         return circuits
-    
+
     def result(self):
         """
         Get the result of the job.
         """
-        state_ints = self._result_handles["state_int"].fetch_all()['value']
+        state_ints = self._result_handles["state_int"].fetch_all()["value"]
         bitstrings = []
         for i, state_int in enumerate(state_ints):
             # Count all occurences of each bitstring and build a dictionary of counted bitstrings
@@ -276,8 +252,7 @@ class ClassicalShadowJob:
             bitstrings.append(counts)
 
         return [(bitstring, self._gate_indices[i]) for i, bitstring in enumerate(bitstrings)]
-    
-    
+
     def ideal_result(self):
         """
         Get the ideal results of the job.
@@ -288,10 +263,5 @@ class ClassicalShadowJob:
             state = Statevector(circuit)
             probs = state.probabilities_dict()
             results.append((probs, self._gate_indices[i]))
-            
+
         return results
-            
-            
-            
-            
-     
